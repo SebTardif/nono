@@ -188,6 +188,19 @@ impl TokenCache {
 // Token exchange (HTTP POST)
 // ────────────────────────────────────────────────────────────────────────────
 
+/// HTTP request-target for a token POST (`path` plus query when present).
+fn token_request_target(parsed: &url::Url) -> String {
+    let path = if parsed.path().is_empty() {
+        "/"
+    } else {
+        parsed.path()
+    };
+    match parsed.query() {
+        Some(q) => format!("{path}?{q}"),
+        None => path.to_string(),
+    }
+}
+
 /// Perform a single `client_credentials` token exchange against the token
 /// endpoint described in `config`.
 ///
@@ -237,15 +250,7 @@ async fn exchange_token(
 
     let default_port: u16 = if is_https { 443 } else { 80 };
     let port = parsed.port().unwrap_or(default_port);
-    let path = if parsed.path().is_empty() {
-        "/"
-    } else {
-        parsed.path()
-    };
-    let path_with_query = match parsed.query() {
-        Some(q) => format!("{}?{}", path, q),
-        None => path.to_string(),
-    };
+    let path_with_query = token_request_target(&parsed);
 
     // ── Build form body ──────────────────────────────────────────────────
     let body = build_token_request_body(&config.client_id, &config.client_secret, &config.scope);
@@ -577,11 +582,11 @@ async fn exchange_jwt_assertion(
         })?
         .to_string();
     let port = parsed.port().unwrap_or(if is_https { 443 } else { 80 });
-    let path = parsed.path().to_string();
+    let path_with_query = token_request_target(&parsed);
 
     let request = Zeroizing::new(format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nAccept: application/json\r\nConnection: close\r\n\r\n{}",
-        path,
+        path_with_query,
         host,
         body.len(),
         body.as_str()
@@ -779,6 +784,22 @@ mod tests {
     #[test]
     fn test_parse_status_code_garbage() {
         assert_eq!(parse_status_code("not http"), 0);
+    }
+
+    #[test]
+    fn token_request_target_keeps_query_string() {
+        let parsed =
+            url::Url::parse("https://auth.example.com/oauth/token?api-version=2024-01-01").unwrap();
+        assert_eq!(
+            token_request_target(&parsed),
+            "/oauth/token?api-version=2024-01-01"
+        );
+    }
+
+    #[test]
+    fn token_request_target_without_query_is_path() {
+        let parsed = url::Url::parse("https://auth.example.com/oauth/token").unwrap();
+        assert_eq!(token_request_target(&parsed), "/oauth/token");
     }
 
     // ── TokenCache expiry logic ──────────────────────────────────────────
