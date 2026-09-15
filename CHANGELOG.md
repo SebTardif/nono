@@ -1,11 +1,5 @@
 # Changelog
 
-## [Unreleased]
-
-### Bug Fixes
-
-- *(proxy)* Preserve query string on jwt-bearer token_url exchanges
-
 ## [0.77.0] - 2026-09-11
 
 ### Bug Fixes
