@@ -1183,13 +1183,16 @@ fn broker_command_with_path(
 ) -> Result<Command> {
     let mut command = Command::new(program);
     if let Some(caps) = outer_caps {
-        let safe_path =
-            crate::broker_path::sanitize_broker_path_for_binary(ambient_path, program, caps);
-        if safe_path.is_empty() {
-            return Err(NonoError::KeystoreAccess(format!(
+        let safe_path = crate::broker_path::safe_broker_path_for_binary(
+            ambient_path,
+            program,
+            caps,
+        )
+        .ok_or_else(|| {
+            NonoError::KeystoreAccess(format!(
                 "cannot resolve '{program}': no remaining PATH entry is safe for this sandbox"
-            )));
-        }
+            ))
+        })?;
         command.env("PATH", safe_path);
     }
     // When a test has installed a thread-local PATH, apply it even if
