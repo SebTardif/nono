@@ -109,7 +109,7 @@ fn decode_impl(input: &str) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sigstore"))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
