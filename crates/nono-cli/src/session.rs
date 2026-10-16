@@ -217,17 +217,33 @@ pub fn sessions_dir() -> Result<PathBuf> {
     crate::state_paths::sessions_dir()
 }
 
-/// Returns the canonical session registry, creating with mode 0o700 if needed.
+/// Returns the canonical session registry, creating it at mode 0o700 if needed.
+///
+/// An existing directory owned by the current user is tightened to 0o700 when
+/// its mode is group or world accessible. A symlink or another owner's
+/// directory is refused.
 pub(crate) fn ensure_sessions_dir() -> Result<PathBuf> {
     let dir = sessions_dir()?;
     ensure_private_dir(&dir)
 }
 
 fn ensure_private_dir(dir: &Path) -> Result<PathBuf> {
-    if dir.exists() {
-        validate_sessions_dir(dir)?;
-        return Ok(dir.to_path_buf());
+    // `Path::exists` follows links. A dangling symlink has to be refused, not
+    // treated as a missing directory.
+    match read_sessions_dir_metadata(dir) {
+        Ok(_) => {}
+        Err(NonoError::ConfigWrite { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            create_private_dir(dir)?;
+        }
+        Err(err) => return Err(err),
     }
+    validate_sessions_dir(dir)?;
+    Ok(dir.to_path_buf())
+}
+
+fn create_private_dir(dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::fs::DirBuilder;
@@ -246,15 +262,46 @@ fn ensure_private_dir(dir: &Path) -> Result<PathBuf> {
             source: e,
         })?;
     }
-    Ok(dir.to_path_buf())
+    Ok(())
 }
 
-fn validate_sessions_dir(dir: &Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(dir).map_err(|e| NonoError::ConfigWrite {
+fn read_sessions_dir_metadata(dir: &Path) -> Result<std::fs::Metadata> {
+    std::fs::symlink_metadata(dir).map_err(|source| NonoError::ConfigWrite {
         path: dir.to_path_buf(),
-        source: e,
-    })?;
+        source,
+    })
+}
 
+/// chmod 0700 without following a symlink swapped in for `dir`.
+#[cfg(unix)]
+fn tighten_owned_directory(dir: &Path) -> Result<()> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(dir)
+        .map_err(|source| NonoError::ConfigWrite {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o700))
+        .map_err(|source| NonoError::ConfigWrite {
+            path: dir.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(unix)]
+fn owned_wide_directory(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return false;
+    }
+    if metadata.uid() != nix::unistd::geteuid().as_raw() {
+        return false;
+    }
+    metadata.permissions().mode() & 0o077 != 0
+}
+
+fn sessions_dir_refusal(dir: &Path, metadata: &std::fs::Metadata) -> Result<()> {
     if metadata.file_type().is_symlink() {
         return Err(NonoError::ConfigParse(format!(
             "{} must not be a symlink",
@@ -290,6 +337,17 @@ fn validate_sessions_dir(dir: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_sessions_dir(dir: &Path) -> Result<()> {
+    let metadata = read_sessions_dir_metadata(dir)?;
+    #[cfg(unix)]
+    if owned_wide_directory(&metadata) {
+        tighten_owned_directory(dir)?;
+        let metadata = read_sessions_dir_metadata(dir)?;
+        return sessions_dir_refusal(dir, &metadata);
+    }
+    sessions_dir_refusal(dir, &metadata)
 }
 
 /// Generate a 16-character hex session ID.
@@ -922,6 +980,94 @@ mod tests {
     fn make_private_dir(path: &Path) {
         let perms = std::fs::Permissions::from_mode(0o700);
         std::fs::set_permissions(path, perms).expect("chmod 700");
+    }
+
+    #[cfg(unix)]
+    fn mode_bits(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_repairs_existing_wide_directory() {
+        let base = tempdir().expect("tempdir");
+        let dir = base.path().join("sessions");
+        std::fs::create_dir(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod 755");
+
+        ensure_private_dir(&dir).expect("owned wide dir is repaired");
+        assert_eq!(mode_bits(&dir), 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_sessions_dir_refuses_symlink_without_changing_target() {
+        let base = tempdir().expect("tempdir");
+        let target = base.path().join("target");
+        std::fs::create_dir(&target).expect("mkdir");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let link = base.path().join("sessions");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let err = validate_sessions_dir(&link).expect_err("symlink must be refused");
+        assert!(
+            matches!(err, NonoError::ConfigParse(ref msg) if msg.contains("symlink")),
+            "expected a symlink refusal, got {err:?}"
+        );
+        assert_eq!(mode_bits(&target), 0o755, "symlink target must stay 0755");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_sessions_dir_refuses_nondirectory_without_chmod() {
+        let base = tempdir().expect("tempdir");
+        let file = base.path().join("sessions");
+        std::fs::write(&file, b"not a directory").expect("write");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let err = validate_sessions_dir(&file).expect_err("file must be refused");
+        assert!(
+            matches!(err, NonoError::ConfigParse(ref msg) if msg.contains("not a directory")),
+            "expected a non-directory refusal, got {err:?}"
+        );
+        assert_eq!(mode_bits(&file), 0o644, "file mode must stay 0644");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_refuses_dangling_symlink() {
+        let base = tempdir().expect("tempdir");
+        let link = base.path().join("sessions");
+        let missing = base.path().join("missing");
+        std::os::unix::fs::symlink(&missing, &link).expect("symlink");
+
+        let err = ensure_private_dir(&link).expect_err("dangling symlink must be refused");
+        assert!(
+            matches!(err, NonoError::ConfigParse(ref msg) if msg.contains("symlink")),
+            "expected a symlink refusal, got {err:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("link metadata")
+                .file_type()
+                .is_symlink(),
+            "the dangling symlink must be left in place"
+        );
+        assert!(!missing.exists(), "refuse must not create the link target");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_creates_missing_directory_mode_0700() {
+        let base = tempdir().expect("tempdir");
+        let dir = base.path().join("sessions");
+
+        ensure_private_dir(&dir).expect("create");
+        assert_eq!(mode_bits(&dir), 0o700);
     }
 
     #[cfg(unix)]
